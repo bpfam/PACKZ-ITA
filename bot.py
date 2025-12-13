@@ -1,13 +1,9 @@
 # =====================================================
-# PACKZ-ITA BOT — FULL v1.0
-# PROTECT + PIN + BROADCAST_DELETE
-# - 3 bottoni: MENÙ, CONTATTI, VETRINA (+ Indietro)
-# - /status, /utenti (CSV), /backup, /restore_db (MERGE)
-# - /broadcast: invia a tutti (testo o copia media in reply)
-# - /broadcast_delete: prova a cancellare l'ULTIMO broadcast
-#   da tutte le chat (finché il bot non viene riavviato)
-# - protect_content=True su tutto (tranne file backup)
-# - FIX BOTTONI: foto + caption + bottoni insieme (così escono sempre)
+# PACKZ-ITA BOT — FULL v1.7 SAFE
+# - Bottoni SEMPRE visibili (niente Markdown/parse_mode)
+# - PIN NO SPAM (salva message_id e aggiorna sempre lo stesso)
+# - /broadcast + /broadcast_delete
+# - /status /utenti (CSV) /backup /restore_db (MERGE)
 # =====================================================
 
 import os, csv, shutil, logging, sqlite3, asyncio as aio
@@ -15,13 +11,10 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    ContextTypes
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.error import RetryAfter, Forbidden, BadRequest, NetworkError
 
-VERSION = "PACKZ-ITA-FULL-1.0-PROTECT-BDEL"
+VERSION = "PACKZ-ITA-FULL-1.7-SAFE"
 
 # ---------------- LOG ----------------
 logging.basicConfig(
@@ -31,9 +24,9 @@ logging.basicConfig(
 log = logging.getLogger("packz-ita")
 
 # ---------------- ENV ----------------
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-DB_FILE     = os.environ.get("DB_FILE", "/var/data/users.db")
-BACKUP_DIR  = os.environ.get("BACKUP_DIR", "/var/data/backup")
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
+DB_FILE    = os.environ.get("DB_FILE", "/var/data/users.db")
+BACKUP_DIR = os.environ.get("BACKUP_DIR", "/var/data/backup")
 
 PHOTO_URL = os.environ.get(
     "PHOTO_URL",
@@ -42,15 +35,12 @@ PHOTO_URL = os.environ.get(
 
 WELCOME_TEXT = os.environ.get(
     "WELCOME_TEXT",
-    "🇮🇹 PACKZ-ITA 🇪🇸\n"
-    "Benvenuto nel bot ufficiale.\n"
-    "Scegli un’opzione qui sotto."
+    "🇮🇹🇪🇸 BENVENUTO IN PACKZ-ITA 🇪🇸🇮🇹\n\nScegli un’opzione qui sotto 👇"
 )
 
 MENU_PAGE_TEXT = os.environ.get(
     "MENU_PAGE_TEXT",
-    "📖 MENÙ — PACKZ-ITA\n"
-    "• Voce A\n• Voce B\n• Voce C"
+    "📖 MENÙ PACKZ-ITA\n• Voce A\n• Voce B\n• Voce C"
 )
 
 INFO_PAGE_TEXT = os.environ.get(
@@ -99,6 +89,28 @@ def init_db():
         first_seen TEXT,
         last_seen TEXT
     )""")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS kv(
+        k TEXT PRIMARY KEY,
+        v TEXT
+    )""")
+    conn.commit()
+    conn.close()
+
+def kv_get(k: str) -> str | None:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT v FROM kv WHERE k=?", (k,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def kv_set(k: str, v: str):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+    INSERT INTO kv(k,v) VALUES(?,?)
+    ON CONFLICT(k) DO UPDATE SET v=excluded.v
+    """, (k, v))
     conn.commit()
     conn.close()
 
@@ -152,7 +164,7 @@ def is_sqlite_db(path: str):
     except Exception as e:
         return False, f"Errore lettura: {e}"
 
-# ---------------- TASTIERA ----------------
+# ---------------- KEYBOARD ----------------
 def kb_home():
     return InlineKeyboardMarkup([
         [
@@ -169,70 +181,102 @@ def kb_back():
         InlineKeyboardButton("⬅️ Indietro", callback_data="HOME")
     ]])
 
-# ---------------- START + PIN AUTO (FIX BOTTONI) ----------------
+# ---------------- PIN (NO SPAM) ----------------
+async def upsert_pin_message(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    total = count_users()
+    text = PIN_TEXT.format(total=total)
+
+    key = f"pin_msg_id:{chat_id}"
+    old = kv_get(key)
+
+    try:
+        if old and old.isdigit():
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=int(old),
+                text=text
+            )
+        else:
+            msg = await context.bot.send_message(chat_id=chat_id, text=text, protect_content=True)
+            kv_set(key, str(msg.message_id))
+            try:
+                await context.bot.pin_chat_message(
+                    chat_id=chat_id,
+                    message_id=msg.message_id,
+                    disable_notification=True
+                )
+            except Exception as e:
+                log.warning("Pin error: %s", e)
+    except Exception as e:
+        # se il vecchio msg non esiste più -> ricreo
+        log.warning("Pin update failed -> recreate: %s", e)
+        try:
+            msg = await context.bot.send_message(chat_id=chat_id, text=text, protect_content=True)
+            kv_set(key, str(msg.message_id))
+            try:
+                await context.bot.pin_chat_message(
+                    chat_id=chat_id,
+                    message_id=msg.message_id,
+                    disable_notification=True
+                )
+            except Exception as e2:
+                log.warning("Pin error2: %s", e2)
+        except Exception as e3:
+            log.warning("Pin error3: %s", e3)
+
+# ---------------- START ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     chat = update.effective_chat
+
     if u:
         upsert_user(u)
 
-    # 1) FOTO + CAPTION + BOTTONI (così escono sempre)
-    sent_main = False
+    # 1) Foto (se fallisce NON blocca)
     try:
-        await chat.send_photo(
-            PHOTO_URL,
-            caption=WELCOME_TEXT,
+        await chat.send_photo(PHOTO_URL, protect_content=True)
+    except Exception as e:
+        log.warning("Photo send error: %s", e)
+
+    # 2) Messaggio con bottoni (questo DEVE uscire)
+    try:
+        await chat.send_message(
+            WELCOME_TEXT,
             reply_markup=kb_home(),
             protect_content=True
         )
-        sent_main = True
     except Exception as e:
-        log.warning(f"Errore invio foto+caption+bottoni: {e}")
-
-    # Fallback: se la foto fallisce, manda testo + bottoni
-    if not sent_main:
+        log.error("WELCOME send error (buttons missing): %s", e)
+        # fallback super-safe
         try:
-            await chat.send_message(
-                WELCOME_TEXT,
-                reply_markup=kb_home(),
-                protect_content=True
-            )
-        except Exception as e:
-            log.warning(f"Errore invio welcome: {e}")
+            await chat.send_message("Apri il menu 👇", reply_markup=kb_home(), protect_content=True)
+        except Exception as e2:
+            log.error("Fallback welcome error: %s", e2)
 
-    # 2) PIN iscritti
+    # 3) PIN aggiornato (1 solo)
     try:
-        total = count_users()
-        stats_msg = await chat.send_message(
-            PIN_TEXT.format(total=total),
-            protect_content=True
-        )
-        try:
-            await context.bot.pin_chat_message(
-                chat_id=chat.id,
-                message_id=stats_msg.message_id,
-                disable_notification=True
-            )
-        except Exception as e:
-            log.warning(f"Errore pin messaggio stats: {e}")
+        await upsert_pin_message(chat.id, context)
     except Exception as e:
-        log.warning(f"Errore invio stats: {e}")
+        log.warning("Pin routine error: %s", e)
 
-# ---------------- BOTTONI INLINE ----------------
+# ---------------- BUTTONS ----------------
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
     await q.answer()
 
-    if q.data == "MENU":
-        await q.message.edit_text(MENU_PAGE_TEXT, reply_markup=kb_back())
-    elif q.data == "INFO":
-        await q.message.edit_text(INFO_PAGE_TEXT, reply_markup=kb_back())
-    elif q.data == "HOME":
-        await q.message.edit_text(WELCOME_TEXT, reply_markup=kb_home())
+    try:
+        if q.data == "MENU":
+            await q.message.edit_text(MENU_PAGE_TEXT, reply_markup=kb_back())
+        elif q.data == "INFO":
+            await q.message.edit_text(INFO_PAGE_TEXT, reply_markup=kb_back())
+        elif q.data == "HOME":
+            await q.message.edit_text(WELCOME_TEXT, reply_markup=kb_home())
+    except Exception as e:
+        log.warning("Edit message error: %s", e)
 
-# ---------------- ADMIN COMANDI ----------------
+# ---------------- ADMIN ----------------
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -276,7 +320,6 @@ async def utenti_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             protect_content=True
         )
 
-# ✅ BACKUP SBLOCCATO (scaricabile)
 async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -288,8 +331,7 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    db_out  = Path(BACKUP_DIR) / f"backup_{stamp}.db"
-
+    db_out = Path(BACKUP_DIR) / f"backup_{stamp}.db"
     shutil.copy2(DB_FILE, db_out)
 
     with open(db_out, "rb") as fh:
@@ -304,10 +346,7 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = update.effective_message
     if not msg.reply_to_message or not msg.reply_to_message.document:
-        await update.message.reply_text(
-            "Per ripristinare: rispondi a un file .db con /restore_db",
-            protect_content=True
-        )
+        await update.message.reply_text("Rispondi a un file .db e scrivi /restore_db", protect_content=True)
         return
 
     doc = msg.reply_to_message.document
@@ -319,7 +358,7 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ok, why = is_sqlite_db(str(tmp))
     if not ok:
-        await update.message.reply_text(f"❌ Il file non è un DB SQLite valido: {why}", protect_content=True)
+        await update.message.reply_text(f"❌ File non valido: {why}", protect_content=True)
         tmp.unlink(missing_ok=True)
         return
 
@@ -342,14 +381,14 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     main.executemany(sql, rows)
     main.commit()
 
-    await update.message.reply_text("✅ Restore completato", protect_content=True)
+    await update.message.reply_text("✅ Restore completato (MERGE)", protect_content=True)
 
     imp.close()
     main.close()
     tmp.unlink(missing_ok=True)
 
 # ---------------- BROADCAST + DELETE ----------------
-LAST_BROADCAST: dict[int, int] = {}  # chat_id -> message_id
+LAST_BROADCAST: dict[int, int] = {}
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -364,20 +403,14 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text_body = None
     mode = "text"
+
     if m.reply_to_message:
         mode = "copy"
-        text_preview = (
-            m.reply_to_message.text
-            or m.reply_to_message.caption
-            or "(media)"
-        )
+        text_preview = (m.reply_to_message.text or m.reply_to_message.caption or "(media)")
     else:
         text_body = " ".join(context.args) if context.args else None
         if not text_body:
-            await m.reply_text(
-                "Uso: /broadcast <testo> oppure in reply a un contenuto /broadcast",
-                protect_content=True
-            )
+            await m.reply_text("Uso: /broadcast <testo> oppure (reply) /broadcast", protect_content=True)
             return
         text_preview = (text_body[:120] + "…") if len(text_body) > 120 else text_body
 
@@ -393,34 +426,22 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = u["user_id"]
         try:
             if mode == "copy" and m.reply_to_message:
-                msg_out = await m.reply_to_message.copy(
-                    chat_id=chat_id,
-                    protect_content=True
-                )
+                msg_out = await m.reply_to_message.copy(chat_id=chat_id, protect_content=True)
             else:
-                msg_out = await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=text_body,
-                    protect_content=True
-                )
+                msg_out = await context.bot.send_message(chat_id=chat_id, text=text_body, protect_content=True)
+
             LAST_BROADCAST[chat_id] = msg_out.message_id
             sent += 1
+
         except Forbidden:
             blocked += 1
         except RetryAfter as e:
             await aio.sleep(e.retry_after + 1)
             try:
                 if mode == "copy" and m.reply_to_message:
-                    msg_out = await m.reply_to_message.copy(
-                        chat_id=chat_id,
-                        protect_content=True
-                    )
+                    msg_out = await m.reply_to_message.copy(chat_id=chat_id, protect_content=True)
                 else:
-                    msg_out = await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=text_body,
-                        protect_content=True
-                    )
+                    msg_out = await context.bot.send_message(chat_id=chat_id, text=text_body, protect_content=True)
                 LAST_BROADCAST[chat_id] = msg_out.message_id
                 sent += 1
             except Exception:
@@ -431,8 +452,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await aio.sleep(0.05)
 
     await info_msg.edit_text(
-        f"✅ Broadcast finito\nTotali: {total}\nInviati: {sent}\n"
-        f"Bloccati: {blocked}\nErrori: {failed}",
+        f"✅ Broadcast finito\nTotali: {total}\nInviati: {sent}\nBloccati: {blocked}\nErrori: {failed}",
         protect_content=True
     )
 
@@ -441,10 +461,7 @@ async def broadcast_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if not LAST_BROADCAST:
-        await update.message.reply_text(
-            "❌ Nessun broadcast recente da cancellare (o bot riavviato).",
-            protect_content=True
-        )
+        await update.message.reply_text("❌ Nessun broadcast recente da cancellare (o bot riavviato).", protect_content=True)
         return
 
     ok = err = 0
@@ -484,11 +501,11 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
 
-    app.add_handler(CommandHandler("status",           status_cmd))
-    app.add_handler(CommandHandler("utenti",           utenti_cmd))
-    app.add_handler(CommandHandler("backup",           backup_cmd))
-    app.add_handler(CommandHandler("restore_db",       restore_db))
-    app.add_handler(CommandHandler("broadcast",        broadcast_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("utenti", utenti_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("restore_db", restore_db))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("broadcast_delete", broadcast_delete_cmd))
 
     log.info("✅ BOT AVVIATO — %s", VERSION)
