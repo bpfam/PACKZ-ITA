@@ -1,5 +1,5 @@
 # =====================================================
-# PACKZ-ITA BOT – FULL v1.7
+# PACKZ-ITA BOT — FULL v1.0
 # PROTECT + PIN + BROADCAST_DELETE
 # - 3 bottoni: MENÙ, CONTATTI, VETRINA (+ Indietro)
 # - /status, /utenti (CSV), /backup, /restore_db (MERGE)
@@ -7,11 +7,13 @@
 # - /broadcast_delete: prova a cancellare l'ULTIMO broadcast
 #   da tutte le chat (finché il bot non viene riavviato)
 # - protect_content=True su tutto (tranne file backup)
+# - FIX BOTTONI: foto + caption + bottoni insieme (così escono sempre)
 # =====================================================
 
 import os, csv, shutil, logging, sqlite3, asyncio as aio
 from pathlib import Path
 from datetime import datetime, timezone
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
@@ -19,7 +21,7 @@ from telegram.ext import (
 )
 from telegram.error import RetryAfter, Forbidden, BadRequest, NetworkError
 
-VERSION = "PACKZ-ITA-FULL-1.7-PROTECT-BDEL"
+VERSION = "PACKZ-ITA-FULL-1.0-PROTECT-BDEL"
 
 # ---------------- LOG ----------------
 logging.basicConfig(
@@ -38,28 +40,27 @@ PHOTO_URL = os.environ.get(
     "https://i.postimg.cc/bv4ssL2t/2A3BDCFD-2D21-41BC-8BFA-9C5D238E5C3B.jpg",
 )
 
-VETRINA_URL = os.environ.get(
-    "VETRINA_URL",
-    "https://bpfam.github.io/PACKZ-ITA/vetrina.html"
-)
-
 WELCOME_TEXT = os.environ.get(
     "WELCOME_TEXT",
-    "🇮🇹🔥 PACKZ-ITA — BOT UFFICIALE 🔥🇮🇹\n"
-    "Se sei qui è perché sei nel posto giusto.\n\n"
-    "✅ Qualità\n🤝 Rispetto\n⚡️ Velocità\n\n"
+    "🇮🇹 PACKZ-ITA 🇪🇸\n"
+    "Benvenuto nel bot ufficiale.\n"
     "Scegli un’opzione qui sotto."
 )
 
 MENU_PAGE_TEXT = os.environ.get(
     "MENU_PAGE_TEXT",
-    "📖 MENÙ PACKZ-ITA\n"
+    "📖 MENÙ — PACKZ-ITA\n"
     "• Voce A\n• Voce B\n• Voce C"
 )
 
 INFO_PAGE_TEXT = os.environ.get(
     "INFO_PAGE_TEXT",
     "📲 CONTATTI & INFO — PACKZ-ITA"
+)
+
+VETRINA_URL = os.environ.get(
+    "VETRINA_URL",
+    "https://bpfam.github.io/PACKZ-ITA/vetrina.html"
 )
 
 PIN_TEXT = os.environ.get(
@@ -168,27 +169,38 @@ def kb_back():
         InlineKeyboardButton("⬅️ Indietro", callback_data="HOME")
     ]])
 
-# ---------------- START + PIN AUTO ----------------
+# ---------------- START + PIN AUTO (FIX BOTTONI) ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     chat = update.effective_chat
     if u:
         upsert_user(u)
 
+    # 1) FOTO + CAPTION + BOTTONI (così escono sempre)
+    sent_main = False
     try:
-        await chat.send_photo(PHOTO_URL, protect_content=True)
-    except Exception as e:
-        log.warning(f"Errore invio foto: {e}")
-
-    try:
-        await chat.send_message(
-            WELCOME_TEXT,
+        await chat.send_photo(
+            PHOTO_URL,
+            caption=WELCOME_TEXT,
             reply_markup=kb_home(),
             protect_content=True
         )
+        sent_main = True
     except Exception as e:
-        log.warning(f"Errore invio welcome: {e}")
+        log.warning(f"Errore invio foto+caption+bottoni: {e}")
 
+    # Fallback: se la foto fallisce, manda testo + bottoni
+    if not sent_main:
+        try:
+            await chat.send_message(
+                WELCOME_TEXT,
+                reply_markup=kb_home(),
+                protect_content=True
+            )
+        except Exception as e:
+            log.warning(f"Errore invio welcome: {e}")
+
+    # 2) PIN iscritti
     try:
         total = count_users()
         stats_msg = await chat.send_message(
@@ -381,22 +393,34 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = u["user_id"]
         try:
             if mode == "copy" and m.reply_to_message:
-                msg_out = await m.reply_to_message.copy(chat_id=chat_id, protect_content=True)
+                msg_out = await m.reply_to_message.copy(
+                    chat_id=chat_id,
+                    protect_content=True
+                )
             else:
-                msg_out = await context.bot.send_message(chat_id=chat_id, text=text_body, protect_content=True)
-
+                msg_out = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text_body,
+                    protect_content=True
+                )
             LAST_BROADCAST[chat_id] = msg_out.message_id
             sent += 1
-
         except Forbidden:
             blocked += 1
         except RetryAfter as e:
             await aio.sleep(e.retry_after + 1)
             try:
                 if mode == "copy" and m.reply_to_message:
-                    msg_out = await m.reply_to_message.copy(chat_id=chat_id, protect_content=True)
+                    msg_out = await m.reply_to_message.copy(
+                        chat_id=chat_id,
+                        protect_content=True
+                    )
                 else:
-                    msg_out = await context.bot.send_message(chat_id=chat_id, text=text_body, protect_content=True)
+                    msg_out = await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=text_body,
+                        protect_content=True
+                    )
                 LAST_BROADCAST[chat_id] = msg_out.message_id
                 sent += 1
             except Exception:
@@ -407,7 +431,8 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await aio.sleep(0.05)
 
     await info_msg.edit_text(
-        f"✅ Broadcast finito\nTotali: {total}\nInviati: {sent}\nBloccati: {blocked}\nErrori: {failed}",
+        f"✅ Broadcast finito\nTotali: {total}\nInviati: {sent}\n"
+        f"Bloccati: {blocked}\nErrori: {failed}",
         protect_content=True
     )
 
