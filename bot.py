@@ -1,11 +1,12 @@
 # =====================================================
-# PACKZ-ITA BOT — FULL v1.7
-# PROTECT + PIN AUTO + BROADCAST_DELETE
-# - Menu + Info con bottone Indietro
-# - /status, /utenti (CSV), /backup, /restore_db (MERGE), /broadcast, /broadcast_delete
-# - protect_content=True su tutti i contenuti
-# - SOLO /backup è SBLOCCATO per il download
-# - Messaggio fissato AUTOMATICO: "👥 Iscritti PACKZ-ITA {totale}"
+# PACKZ-ITA BOT – FULL v1.7
+# PROTECT + PIN + BROADCAST_DELETE
+# - 3 bottoni: MENÙ, CONTATTI, VETRINA (+ Indietro)
+# - /status, /utenti (CSV), /backup, /restore_db (MERGE)
+# - /broadcast: invia a tutti (testo o copia media in reply)
+# - /broadcast_delete: prova a cancellare l'ULTIMO broadcast
+#   da tutte le chat (finché il bot non viene riavviato)
+# - protect_content=True su tutto (tranne file backup)
 # =====================================================
 
 import os, csv, shutil, logging, sqlite3, asyncio as aio
@@ -18,7 +19,7 @@ from telegram.ext import (
 )
 from telegram.error import RetryAfter, Forbidden, BadRequest, NetworkError
 
-VERSION = "PACKZ-ITA-FULL-1.7-PROTECT-AUTO-BDEL"
+VERSION = "PACKZ-ITA-FULL-1.7-PROTECT-BDEL"
 
 # ---------------- LOG ----------------
 logging.basicConfig(
@@ -37,7 +38,6 @@ PHOTO_URL = os.environ.get(
     "https://i.postimg.cc/bv4ssL2t/2A3BDCFD-2D21-41BC-8BFA-9C5D238E5C3B.jpg",
 )
 
-# Link vetrina (metti il tuo)
 VETRINA_URL = os.environ.get(
     "VETRINA_URL",
     "https://bpfam.github.io/PACKZ-ITA/vetrina.html"
@@ -45,15 +45,26 @@ VETRINA_URL = os.environ.get(
 
 WELCOME_TEXT = os.environ.get(
     "WELCOME_TEXT",
-    "🔥 BENVENUTO NEL BOT UFFICIALE PACKZ-ITA 🔥\nScegli un’opzione qui sotto."
+    "🇮🇹🔥 PACKZ-ITA — BOT UFFICIALE 🔥🇮🇹\n"
+    "Se sei qui è perché sei nel posto giusto.\n\n"
+    "✅ Qualità\n🤝 Rispetto\n⚡️ Velocità\n\n"
+    "Scegli un’opzione qui sotto."
 )
+
 MENU_PAGE_TEXT = os.environ.get(
     "MENU_PAGE_TEXT",
-    "📖 MENÙ\n• Voce A\n• Voce B\n• Voce C"
+    "📖 MENÙ PACKZ-ITA\n"
+    "• Voce A\n• Voce B\n• Voce C"
 )
+
 INFO_PAGE_TEXT = os.environ.get(
     "INFO_PAGE_TEXT",
     "📲 CONTATTI & INFO — PACKZ-ITA"
+)
+
+PIN_TEXT = os.environ.get(
+    "PIN_TEXT",
+    "👥 Iscritti PACKZ-ITA {total}"
 )
 
 # ---------------- ADMIN ----------------
@@ -140,12 +151,12 @@ def is_sqlite_db(path: str):
     except Exception as e:
         return False, f"Errore lettura: {e}"
 
-# ---------------- KEYBOARD ----------------
+# ---------------- TASTIERA ----------------
 def kb_home():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📖 MENÙ", callback_data="MENU"),
-            InlineKeyboardButton("📲 CONTATTI", callback_data="INFO")
+            InlineKeyboardButton("📲 CONTATTI", callback_data="INFO"),
         ],
         [
             InlineKeyboardButton("🎥 VETRINA", url=VETRINA_URL)
@@ -181,7 +192,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         total = count_users()
         stats_msg = await chat.send_message(
-            f"👥 Iscritti PACKZ-ITA {total}",
+            PIN_TEXT.format(total=total),
             protect_content=True
         )
         try:
@@ -195,7 +206,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.warning(f"Errore invio stats: {e}")
 
-# ---------------- BOTTONI ----------------
+# ---------------- BOTTONI INLINE ----------------
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
@@ -217,8 +228,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Online v{VERSION}\n"
         f"👥 Utenti: {count_users()}\n"
         f"DB: {DB_FILE}\n"
-        f"Backup dir: {BACKUP_DIR}\n"
-        f"Vetrina: {VETRINA_URL}",
+        f"Backup dir: {BACKUP_DIR}",
         protect_content=True
     )
 
@@ -365,41 +375,28 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         protect_content=True
     )
 
-    # salva SOLO questo broadcast (così /broadcast_delete cancella quello)
     LAST_BROADCAST.clear()
 
     for u in users:
         chat_id = u["user_id"]
         try:
             if mode == "copy" and m.reply_to_message:
-                msg_out = await m.reply_to_message.copy(
-                    chat_id=chat_id,
-                    protect_content=True
-                )
+                msg_out = await m.reply_to_message.copy(chat_id=chat_id, protect_content=True)
             else:
-                msg_out = await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=text_body,
-                    protect_content=True
-                )
+                msg_out = await context.bot.send_message(chat_id=chat_id, text=text_body, protect_content=True)
+
             LAST_BROADCAST[chat_id] = msg_out.message_id
             sent += 1
+
         except Forbidden:
             blocked += 1
         except RetryAfter as e:
             await aio.sleep(e.retry_after + 1)
             try:
                 if mode == "copy" and m.reply_to_message:
-                    msg_out = await m.reply_to_message.copy(
-                        chat_id=chat_id,
-                        protect_content=True
-                    )
+                    msg_out = await m.reply_to_message.copy(chat_id=chat_id, protect_content=True)
                 else:
-                    msg_out = await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=text_body,
-                        protect_content=True
-                    )
+                    msg_out = await context.bot.send_message(chat_id=chat_id, text=text_body, protect_content=True)
                 LAST_BROADCAST[chat_id] = msg_out.message_id
                 sent += 1
             except Exception:
@@ -462,11 +459,11 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
 
-    app.add_handler(CommandHandler("status",          status_cmd))
-    app.add_handler(CommandHandler("utenti",          utenti_cmd))
-    app.add_handler(CommandHandler("backup",          backup_cmd))
-    app.add_handler(CommandHandler("restore_db",      restore_db))
-    app.add_handler(CommandHandler("broadcast",       broadcast_cmd))
+    app.add_handler(CommandHandler("status",           status_cmd))
+    app.add_handler(CommandHandler("utenti",           utenti_cmd))
+    app.add_handler(CommandHandler("backup",           backup_cmd))
+    app.add_handler(CommandHandler("restore_db",       restore_db))
+    app.add_handler(CommandHandler("broadcast",        broadcast_cmd))
     app.add_handler(CommandHandler("broadcast_delete", broadcast_delete_cmd))
 
     log.info("✅ BOT AVVIATO — %s", VERSION)
