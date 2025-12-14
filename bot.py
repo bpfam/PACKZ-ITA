@@ -1,38 +1,33 @@
 # =====================================================
-# PACKZ-ITA BOT — FULL v1.7
+# PACKZ-ITA BOT — FULL v1.7 (FIX DB + MENU)
 # PROTECT + PIN + BROADCAST_DELETE
 # - 3 bottoni: MENÙ, CONTATTI, VETRINA (+ Indietro)
 # - /status, /utenti (CSV), /backup, /restore_db (MERGE)
-# - /broadcast: invia a tutti (testo o copia media in reply)
-# - /broadcast_delete: cancella l'ULTIMO broadcast (finché non riavvii)
+# - /broadcast + /broadcast_delete
 # - protect_content=True su tutto (tranne file backup)
+# - FIX: migrazione DB automatica + upsert safe (tasti escono sempre)
 # =====================================================
 
 import os, csv, shutil, logging, sqlite3, asyncio as aio
 from pathlib import Path
 from datetime import datetime, timezone
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.error import RetryAfter, Forbidden, BadRequest, NetworkError
 
-VERSION = "PACKZ-ITA-FULL-1.7-PROTECT-BDEL"
+VERSION = "PACKZ-ITA-FULL-1.7-FIX-DB"
 
 # ---------------- LOG ----------------
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger("packz-ita")
 
 # ---------------- ENV ----------------
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-DB_FILE     = os.environ.get("DB_FILE", "/var/data/users.db")
-BACKUP_DIR  = os.environ.get("BACKUP_DIR", "/var/data/backup")
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "").strip()
+DB_FILE     = os.environ.get("DB_FILE", "/var/data/users.db").strip()
+BACKUP_DIR  = os.environ.get("BACKUP_DIR", "/var/data/backup").strip()
 
-PHOTO_URL = os.environ.get(
-    "PHOTO_URL",
-    "https://i.postimg.cc/bv4ssL2t/2A3BDCFD-2D21-41BC-8BFA-9C5D238E5C3B.jpg",
-)
+PHOTO_URL = os.environ.get("PHOTO_URL", "").strip()
 
 WELCOME_TEXT = os.environ.get(
     "WELCOME_TEXT",
@@ -54,7 +49,9 @@ INFO_PAGE_TEXT = os.environ.get(
 VETRINA_URL = os.environ.get(
     "VETRINA_URL",
     "https://bpfam.github.io/PACKZ-ITA/index.html"
-)
+).strip()
+
+PIN_TEMPLATE = os.environ.get("PIN_TEMPLATE", "👥 Iscritti PACKZ-ITA {total}")
 
 # ---------------- ADMIN ----------------
 def build_admin_ids() -> set[int]:
@@ -74,11 +71,20 @@ def is_admin(uid: int | None) -> bool:
         return True
     return bool(uid) and uid in ADMIN_IDS
 
-# ---------------- DB ----------------
-def init_db():
+# ---------------- DB (MIGRAZIONE FORTE) ----------------
+EXPECTED = ["user_id","username","first_name","last_name","first_seen","last_seen"]
+
+def db_conn():
     Path(DB_FILE).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("""
+    return sqlite3.connect(DB_FILE)
+
+def ensure_users_table():
+    """Crea o MIGRA la tabella users se vecchia/incompatibile."""
+    conn = db_conn()
+    cur = conn.cursor()
+
+    # crea se non esiste
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS users(
         user_id INTEGER PRIMARY KEY,
         username TEXT,
@@ -86,14 +92,61 @@ def init_db():
         last_name TEXT,
         first_seen TEXT,
         last_seen TEXT
-    )""")
+    )
+    """)
+    conn.commit()
+
+    # controlla schema reale
+    cur.execute("PRAGMA table_info(users)")
+    cols = [r[1] for r in cur.fetchall()]
+
+    if cols == EXPECTED:
+        conn.close()
+        return
+
+    # Se schema diverso -> ricostruisci tabella "users_new" e copia quello che c'è
+    log.warning("DB schema diverso (%s). Migrazione in corso...", cols)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users_new(
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        first_seen TEXT,
+        last_seen TEXT
+    )
+    """)
+
+    # copia solo colonne che esistono (intersection)
+    common = [c for c in EXPECTED if c in cols]
+    if "user_id" not in common:
+        # non possiamo migrare senza user_id -> riparti pulito
+        log.warning("DB vecchio senza user_id. Ricreo DB pulito.")
+        cur.execute("DROP TABLE IF EXISTS users")
+        cur.execute("ALTER TABLE users_new RENAME TO users")
+        conn.commit()
+        conn.close()
+        return
+
+    sel = ",".join(common)
+    ins_cols = ",".join(common)
+
+    # inserisco nelle colonne comuni, le altre restano NULL
+    cur.execute(f"INSERT OR IGNORE INTO users_new ({ins_cols}) SELECT {sel} FROM users")
+
+    # sostituisci tabella
+    cur.execute("DROP TABLE users")
+    cur.execute("ALTER TABLE users_new RENAME TO users")
     conn.commit()
     conn.close()
+    log.info("DB migration completata ✅")
 
 def upsert_user(u):
     if not u:
         return
-    conn = sqlite3.connect(DB_FILE)
+    ensure_users_table()
+    conn = db_conn()
     cur = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
 
@@ -114,19 +167,19 @@ def upsert_user(u):
     conn.close()
 
 def count_users():
-    conn = sqlite3.connect(DB_FILE)
+    ensure_users_table()
+    conn = db_conn()
     n = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     conn.close()
     return n
 
 def get_all_users():
-    conn = sqlite3.connect(DB_FILE)
+    ensure_users_table()
+    conn = db_conn()
     conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users ORDER BY first_seen ASC")
-    rows = [dict(r) for r in cur.fetchall()]
+    rows = conn.execute("SELECT * FROM users ORDER BY first_seen ASC").fetchall()
     conn.close()
-    return rows
+    return [dict(r) for r in rows]
 
 def is_sqlite_db(path: str):
     p = Path(path)
@@ -165,30 +218,36 @@ def kb_back():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     chat = update.effective_chat
-    if u:
-        upsert_user(u)
 
-    # foto logo
+    # ✅ non bloccare mai i tasti per colpa DB
     try:
-        await chat.send_photo(PHOTO_URL, protect_content=True)
+        if u:
+            upsert_user(u)
     except Exception as e:
-        log.warning(f"Errore invio foto: {e}")
+        log.warning("DB upsert fallito (non blocco start): %s", e)
 
-    # testo benvenuto + bottoni
+    # logo
+    if PHOTO_URL:
+        try:
+            await chat.send_photo(photo=PHOTO_URL, protect_content=True)
+        except Exception as e:
+            log.warning("Errore invio foto: %s", e)
+
+    # welcome + bottoni (QUESTO DEVE SEMPRE USCIRE)
     try:
         await chat.send_message(
-            WELCOME_TEXT,
+            text=WELCOME_TEXT,
             reply_markup=kb_home(),
             protect_content=True
         )
     except Exception as e:
-        log.warning(f"Errore invio welcome: {e}")
+        log.warning("Errore invio welcome: %s", e)
 
-    # messaggio fissato con conteggio iscritti
+    # pin iscritti
     try:
         total = count_users()
         stats_msg = await chat.send_message(
-            f"👥 Iscritti PACKZ-ITA {total}",
+            text=PIN_TEMPLATE.format(total=total),
             protect_content=True
         )
         try:
@@ -198,9 +257,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_notification=True
             )
         except Exception as e:
-            log.warning(f"Errore pin messaggio stats: {e}")
+            log.warning("Errore pin messaggio stats: %s", e)
     except Exception as e:
-        log.warning(f"Errore invio stats: {e}")
+        log.warning("Errore invio stats: %s", e)
 
 # ---------------- BOTTONI INLINE ----------------
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -209,12 +268,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await q.answer()
 
-    if q.data == "MENU":
-        await q.message.edit_text(MENU_PAGE_TEXT, reply_markup=kb_back())
-    elif q.data == "INFO":
-        await q.message.edit_text(INFO_PAGE_TEXT, reply_markup=kb_back())
-    elif q.data == "HOME":
-        await q.message.edit_text(WELCOME_TEXT, reply_markup=kb_home())
+    try:
+        if q.data == "MENU":
+            await q.message.edit_text(MENU_PAGE_TEXT, reply_markup=kb_back())
+        elif q.data == "INFO":
+            await q.message.edit_text(INFO_PAGE_TEXT, reply_markup=kb_back())
+        elif q.data == "HOME":
+            await q.message.edit_text(WELCOME_TEXT, reply_markup=kb_home())
+    except BadRequest:
+        # se non può editare, invia nuovo messaggio
+        await q.message.reply_text(WELCOME_TEXT, reply_markup=kb_home(), protect_content=True)
 
 # ---------------- ADMIN COMANDI ----------------
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -224,7 +287,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Online v{VERSION}\n"
         f"👥 Utenti: {count_users()}\n"
         f"DB: {DB_FILE}\n"
-        f"Backup dir: {BACKUP_DIR}",
+        f"Backup dir: {BACKUP_DIR}\n"
+        f"Vetrina: {VETRINA_URL}",
         protect_content=True
     )
 
@@ -260,7 +324,6 @@ async def utenti_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             protect_content=True
         )
 
-# ✅ BACKUP SBLOCCATO (scaricabile)
 async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -307,8 +370,21 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp.unlink(missing_ok=True)
         return
 
+    ensure_users_table()
+
     main = sqlite3.connect(DB_FILE)
     imp  = sqlite3.connect(tmp)
+
+    # verifica colonne nel db import
+    imp_cur = imp.cursor()
+    imp_cur.execute("PRAGMA table_info(users)")
+    cols = [r[1] for r in imp_cur.fetchall()]
+    need = ["user_id","username","first_name","last_name","first_seen","last_seen"]
+    if not all(c in cols for c in need):
+        await update.message.reply_text("❌ DB importato incompatibile (tabella users diversa).", protect_content=True)
+        imp.close(); main.close()
+        tmp.unlink(missing_ok=True)
+        return
 
     rows = imp.execute(
         "SELECT user_id,username,first_name,last_name,first_seen,last_seen FROM users"
@@ -326,14 +402,14 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     main.executemany(sql, rows)
     main.commit()
 
-    await update.message.reply_text("✅ Restore completato", protect_content=True)
+    await update.message.reply_text("✅ Restore (merge) completato", protect_content=True)
 
     imp.close()
     main.close()
     tmp.unlink(missing_ok=True)
 
 # ---------------- BROADCAST + DELETE ----------------
-LAST_BROADCAST: dict[int, int] = {}  # chat_id -> message_id
+LAST_BROADCAST: dict[int, int] = {}
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -354,7 +430,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text_body = " ".join(context.args) if context.args else None
         if not text_body:
-            await m.reply_text("Uso: /broadcast <testo> oppure in reply a un contenuto /broadcast", protect_content=True)
+            await m.reply_text("Uso: /broadcast <testo> oppure in reply /broadcast", protect_content=True)
             return
         text_preview = (text_body[:120] + "…") if len(text_body) > 120 else text_body
 
@@ -373,8 +449,10 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg_out = await m.reply_to_message.copy(chat_id=chat_id, protect_content=True)
             else:
                 msg_out = await context.bot.send_message(chat_id=chat_id, text=text_body, protect_content=True)
+
             LAST_BROADCAST[chat_id] = msg_out.message_id
             sent += 1
+
         except Forbidden:
             blocked += 1
         except RetryAfter as e:
@@ -403,10 +481,7 @@ async def broadcast_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if not LAST_BROADCAST:
-        await update.message.reply_text(
-            "❌ Nessun broadcast recente da cancellare (o bot riavviato).",
-            protect_content=True
-        )
+        await update.message.reply_text("❌ Nessun broadcast recente da cancellare (o bot riavviato).", protect_content=True)
         return
 
     ok = err = 0
@@ -428,33 +503,29 @@ async def broadcast_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         await aio.sleep(0.05)
 
     LAST_BROADCAST.clear()
-
-    await update.message.reply_text(
-        f"🧹 Broadcast cancellato.\n✅ Eliminati: {ok}\n⚠️ Errori: {err}",
-        protect_content=True
-    )
+    await update.message.reply_text(f"🧹 Broadcast cancellato.\n✅ Eliminati: {ok}\n⚠️ Errori: {err}", protect_content=True)
 
 # ---------------- MAIN ----------------
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN mancante")
 
-    init_db()
+    ensure_users_table()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
 
-    app.add_handler(CommandHandler("status",          status_cmd))
-    app.add_handler(CommandHandler("utenti",          utenti_cmd))
-    app.add_handler(CommandHandler("backup",          backup_cmd))
-    app.add_handler(CommandHandler("restore_db",      restore_db))
-    app.add_handler(CommandHandler("broadcast",       broadcast_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("utenti", utenti_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("restore_db", restore_db))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("broadcast_delete", broadcast_delete_cmd))
 
     log.info("✅ BOT AVVIATO — %s", VERSION)
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
