@@ -1,10 +1,8 @@
 # =====================================================
 # PACKZ-ITA BOT — PRO v2.0 (STABLE)  [NO STATS PIN]
-# - Menu + Contatti + Vetrina
-# - Admin: /whoami /status /utenti /backup /restore_db
-# - Broadcast + Broadcast_delete
-# - Restore DB compatibile con DB di altri bot (colonne diverse)
-# - MODIFICA UNICA: tolto messaggio+pin "👥 Iscritti ..."
+# - FIX CALLBACK "Query is too old" (answer safe + edit safe)
+# - concurrent_updates ON per non bloccare i click durante broadcast/restore
+# - broadcast handler non bloccante
 # =====================================================
 
 import os, csv, shutil, logging, sqlite3, asyncio as aio
@@ -31,7 +29,6 @@ BACKUP_DIR = os.environ.get("BACKUP_DIR", "/var/data/backup").strip()
 PHOTO_URL   = os.environ.get("PHOTO_URL", "").strip()
 VETRINA_URL = os.environ.get("VETRINA_URL", "").strip()
 
-# ✅ default senza "usa i pulsanti qui sotto"
 WELCOME_TEXT   = os.environ.get("WELCOME_TEXT", "ＰＡＣＫＺ－ＩＴＡ\nＯＦＦＩＣＩＡＬ 🇪🇸🇮🇹").strip()
 MENU_PAGE_TEXT = os.environ.get("MENU_PAGE_TEXT", "📖 MENÙ PACKZ-ITA").strip()
 INFO_PAGE_TEXT = os.environ.get("INFO_PAGE_TEXT", "📲 CONTATTI PACKZ-ITA").strip()
@@ -50,7 +47,6 @@ ADMIN_IDS = build_admin_ids()
 log.info("ADMIN_IDS=%s", ADMIN_IDS)
 
 def is_admin(uid: int | None) -> bool:
-    # Se ADMIN_IDS vuoto => tutti admin (comodo nei test)
     if not ADMIN_IDS:
         return True
     return bool(uid) and uid in ADMIN_IDS
@@ -120,25 +116,43 @@ def is_sqlite_db(path: str):
     except Exception as e:
         return False, f"Errore lettura: {e}"
 
-def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    cols = set()
-    for r in conn.execute(f"PRAGMA table_info({table})").fetchall():
-        cols.add(r[1])
-    return cols
-
 # ---------------- TASTIERA ----------------
 def kb_home():
     rows = [[
         InlineKeyboardButton("📖 MENÙ", callback_data="MENU"),
         InlineKeyboardButton("📲 CONTATTI", callback_data="INFO"),
     ]]
-    # Vetrina SOLO se c'è il link
     if VETRINA_URL:
         rows.append([InlineKeyboardButton("🎥 VETRINA", url=VETRINA_URL)])
     return InlineKeyboardMarkup(rows)
 
 def kb_back():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Indietro", callback_data="HOME")]])
+
+# ---------------- SAFE HELPERS ----------------
+async def safe_answer(q):
+    try:
+        await q.answer()
+    except BadRequest:
+        # query scaduta / invalid: ignora
+        pass
+    except Exception:
+        pass
+
+async def safe_edit_or_send(q, text, reply_markup):
+    # prova a editare, se fallisce manda un nuovo messaggio
+    try:
+        await q.message.edit_text(text, reply_markup=reply_markup)
+    except BadRequest:
+        try:
+            await q.message.reply_text(text, reply_markup=reply_markup, protect_content=True)
+        except Exception:
+            pass
+    except Exception:
+        try:
+            await q.message.reply_text(text, reply_markup=reply_markup, protect_content=True)
+        except Exception:
+            pass
 
 # ---------------- START ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -159,21 +173,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         protect_content=True
     )
 
-    # ❌ MODIFICA UNICA: tolto pin iscritti (niente stats, niente pin)
-
 # ---------------- CALLBACK ----------------
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
-    await q.answer()
+
+    # ✅ importantissimo: rispondi subito ma senza crash se è scaduta
+    await safe_answer(q)
 
     if q.data == "MENU":
-        await q.message.edit_text(MENU_PAGE_TEXT, reply_markup=kb_back())
+        await safe_edit_or_send(q, MENU_PAGE_TEXT, kb_back())
     elif q.data == "INFO":
-        await q.message.edit_text(INFO_PAGE_TEXT, reply_markup=kb_back())
+        await safe_edit_or_send(q, INFO_PAGE_TEXT, kb_back())
     elif q.data == "HOME":
-        await q.message.edit_text(WELCOME_TEXT, reply_markup=kb_home())
+        await safe_edit_or_send(q, WELCOME_TEXT, kb_home())
 
 # ---------------- ADMIN UTILS ----------------
 async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -240,7 +254,8 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open(out, "rb") as fh:
         await update.effective_message.reply_document(
             document=InputFile(fh, filename=out.name),
-            caption="✅ Backup pronto da scaricare"
+            caption="✅ Backup pronto da scaricare",
+            protect_content=True
         )
 
 # ---------------- RESTORE DB (COMPATIBILE CON DB DIVERSI) ----------------
@@ -331,31 +346,11 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- BROADCAST + DELETE ----------------
 LAST_BROADCAST: dict[int, int] = {}
 
-async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-
-    m = update.effective_message
+async def _broadcast_worker(m, context: ContextTypes.DEFAULT_TYPE, text_body, mode):
     users = get_all_users()
     total = len(users)
-    if total == 0:
-        await m.reply_text("Nessun utente nel DB.", protect_content=True)
-        return
 
-    mode = "text"
-    text_body = None
-
-    if m.reply_to_message:
-        mode = "copy"
-        preview = m.reply_to_message.text or m.reply_to_message.caption or "(media)"
-    else:
-        text_body = " ".join(context.args) if context.args else None
-        if not text_body:
-            await m.reply_text("Uso: /broadcast <testo> oppure reply a un contenuto con /broadcast", protect_content=True)
-            return
-        preview = text_body[:120] + ("…" if len(text_body) > 120 else "")
-
-    info = await m.reply_text(f"📣 Broadcast iniziato\nUtenti: {total}\nAnteprima: {preview}", protect_content=True)
+    info = await m.reply_text("📣 Broadcast in corso…", protect_content=True)
     LAST_BROADCAST.clear()
 
     sent = blocked = failed = 0
@@ -386,10 +381,42 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await aio.sleep(0.05)
 
-    await info.edit_text(
-        f"✅ Broadcast finito\nTotali: {total}\nInviati: {sent}\nBloccati: {blocked}\nErrori: {failed}",
-        protect_content=True
-    )
+    try:
+        await info.edit_text(
+            f"✅ Broadcast finito\nTotali: {total}\nInviati: {sent}\nBloccati: {blocked}\nErrori: {failed}",
+            protect_content=True
+        )
+    except Exception:
+        pass
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    m = update.effective_message
+    users = get_all_users()
+    total = len(users)
+    if total == 0:
+        await m.reply_text("Nessun utente nel DB.", protect_content=True)
+        return
+
+    mode = "text"
+    text_body = None
+
+    if m.reply_to_message:
+        mode = "copy"
+        preview = m.reply_to_message.text or m.reply_to_message.caption or "(media)"
+    else:
+        text_body = " ".join(context.args) if context.args else None
+        if not text_body:
+            await m.reply_text("Uso: /broadcast <testo> oppure reply a un contenuto con /broadcast", protect_content=True)
+            return
+        preview = text_body[:120] + ("…" if len(text_body) > 120 else "")
+
+    await m.reply_text(f"📣 Broadcast avviato (non blocca i click)\nUtenti: {total}\nAnteprima: {preview}", protect_content=True)
+
+    # ✅ non bloccare: parte in background
+    context.application.create_task(_broadcast_worker(m, context, text_body, mode))
 
 async def broadcast_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -428,7 +455,8 @@ def main():
     init_db()
     Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # ✅ IMPORTANT: concurrent_updates ON
+    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
@@ -439,8 +467,10 @@ def main():
     app.add_handler(CommandHandler("utenti", utenti_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("restore_db", restore_db))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    app.add_handler(CommandHandler("broadcast_delete", broadcast_delete_cmd))
+
+    # ✅ broadcast non bloccante (handler già ok perché worker in create_task)
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd, block=False))
+    app.add_handler(CommandHandler("broadcast_delete", broadcast_delete_cmd, block=False))
 
     log.info("✅ BOT AVVIATO — %s", VERSION)
     app.run_polling()
